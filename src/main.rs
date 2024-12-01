@@ -4,10 +4,12 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tracing;
 
 const RTMP_VERSION: u8 = 3;
 const DEFAULT_CHUNK_SIZE: u32 = 128;
@@ -26,6 +28,15 @@ const RTMP_MSG_AMF3_DATA: u8 = 0x0F;
 const RTMP_MSG_AMF0_CMD: u8 = 0x14;
 const RTMP_MSG_AMF0_DATA: u8 = 0x12;
 
+// User control message event types
+const USER_CONTROL_STREAM_BEGIN: u16 = 0;
+const USER_CONTROL_STREAM_EOF: u16 = 1;
+const USER_CONTROL_STREAM_DRY: u16 = 2;
+const USER_CONTROL_SET_BUFFER_LENGTH: u16 = 3;
+const USER_CONTROL_STREAM_IS_RECORDED: u16 = 4;
+const USER_CONTROL_PING_REQUEST: u16 = 6;
+const USER_CONTROL_PING_RESPONSE: u16 = 7;
+
 #[derive(Error, Debug)]
 pub enum RtmpError {
     #[error("IO error: {0}")]
@@ -36,6 +47,8 @@ pub enum RtmpError {
     InvalidChunkSize(u32),
     #[error("Invalid AMF data: {0}")]
     InvalidAmf(String),
+    #[error("Timeout error: {0}")]
+    Timeout(String),
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +82,7 @@ struct RtmpChunk {
     message_stream_id: u32,
     data: Vec<u8>,
 }
-// Add this struct to store previous chunk information
+
 #[derive(Debug, Clone, Default)]
 struct ChunkStreamState {
     timestamp: u32,
@@ -80,6 +93,27 @@ struct ChunkStreamState {
     data: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct ConnectionState {
+    transaction_id: f64,
+    stream_id: u32,
+    is_connected: bool,
+    app_name: Option<String>,
+    stream_key: Option<String>,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self {
+            transaction_id: 0.0,
+            stream_id: 0,
+            is_connected: false,
+            app_name: None,
+            stream_key: None,
+        }
+    }
+}
+
 struct RtmpConnection {
     socket: tokio::net::TcpStream,
     buffer: BytesMut,
@@ -87,6 +121,7 @@ struct RtmpConnection {
     streams: Arc<DashMap<u32, StreamMetadata>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     chunk_states: HashMap<u32, ChunkStreamState>,
+    state: ConnectionState,
 }
 
 impl RtmpConnection {
@@ -99,14 +134,159 @@ impl RtmpConnection {
             streams,
             broadcast_tx: tx,
             chunk_states: HashMap::new(),
+            state: ConnectionState::default(),
         }
+    }
+
+    fn parse_stream_name(&self, data: &[u8]) -> Option<String> {
+        // Skip command name
+        let mut pos = 3 + u16::from_be_bytes([data[1], data[2]]) as usize;
+
+        // Skip transaction ID
+        if data.len() < pos + 9 {
+            return None;
+        }
+        pos += 9;
+
+        // Skip NULL marker if present
+        if data[pos] == 0x05 {
+            pos += 1;
+        }
+
+        // Get stream name
+        if data.len() < pos + 3 {
+            return None;
+        }
+
+        if data[pos] != 0x02 {
+            // String marker
+            return None;
+        }
+        pos += 1;
+
+        let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+
+        if pos + name_len > data.len() {
+            return None;
+        }
+
+        String::from_utf8_lossy(&data[pos..pos + name_len])
+            .into_owned()
+            .into()
+    }
+
+    fn parse_app_name_from_connect(&self, data: &[u8]) -> Option<String> {
+        let mut pos = 3 + u16::from_be_bytes([data[1], data[2]]) as usize;
+
+        // Skip transaction ID (number marker + 8 bytes)
+        if data.len() < pos + 9 {
+            return None;
+        }
+        pos += 9;
+
+        // Must have object marker (0x03)
+        if data.len() <= pos || data[pos] != 0x03 {
+            return None;
+        }
+        pos += 1;
+
+        // Parse command object properties
+        while pos + 2 < data.len() {
+            // Check for object end marker
+            if data[pos] == 0x00 && data[pos + 1] == 0x00 && data[pos + 2] == 0x09 {
+                break;
+            }
+
+            // Get property name length
+            let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+
+            if pos + name_len >= data.len() {
+                return None;
+            }
+
+            // Get property name
+            let prop_name = std::str::from_utf8(&data[pos..pos + name_len]).ok()?;
+            pos += name_len;
+
+            if prop_name == "app" {
+                // Must have string marker (0x02)
+                if pos >= data.len() || data[pos] != 0x02 {
+                    return None;
+                }
+                pos += 1;
+
+                // Get string length
+                if pos + 2 > data.len() {
+                    return None;
+                }
+                let str_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+
+                if pos + str_len > data.len() {
+                    return None;
+                }
+
+                return Some(String::from_utf8_lossy(&data[pos..pos + str_len]).into_owned());
+            }
+
+            // Skip value based on type marker
+            if pos >= data.len() {
+                return None;
+            }
+
+            match data[pos] {
+                0x02 => {
+                    // String
+                    pos += 1;
+                    if pos + 2 > data.len() {
+                        return None;
+                    }
+                    let skip_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2 + skip_len;
+                }
+                0x00 => {
+                    // Number
+                    pos += 9; // Skip type marker + 8 bytes
+                }
+                0x05 => {
+                    // Null
+                    pos += 1;
+                }
+                _ => return None, // Unknown type marker
+            }
+        }
+
+        None
+    }
+
+    fn log_connection_state(&self) {
+        tracing::debug!("Connection state:");
+        tracing::debug!("  Chunk size: {}", self.chunk_size);
+        tracing::debug!("  Is connected: {}", self.state.is_connected);
+        tracing::debug!("  Stream ID: {}", self.state.stream_id);
+        tracing::debug!("  App name: {:?}", self.state.app_name);
+        tracing::debug!("  Stream key: {:?}", self.state.stream_key);
+        tracing::debug!("  Active chunks: {}", self.chunk_states.len());
+        tracing::debug!("  Buffer size: {}", self.buffer.len());
+        tracing::debug!("  Transaction ID: {}", self.state.transaction_id);
     }
 
     async fn handle_connection(mut self) -> Result<(), RtmpError> {
         self.perform_handshake().await?;
 
-        while let Some(chunk) = self.read_chunk().await? {
-            self.process_chunk(chunk).await?;
+        loop {
+            match self.read_chunk().await? {
+                Some(chunk) => {
+                    self.process_chunk(chunk).await?;
+                    self.log_connection_state();
+                }
+                None => {
+                    tracing::info!("Connection closed");
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -116,7 +296,6 @@ impl RtmpConnection {
         let mut c0c1 = [0u8; 1537];
         self.socket.read_exact(&mut c0c1).await?;
 
-        // Validate RTMP version
         if c0c1[0] != RTMP_VERSION {
             return Err(RtmpError::Protocol(format!(
                 "Unsupported RTMP version: {}",
@@ -126,10 +305,8 @@ impl RtmpConnection {
 
         tracing::debug!("Received C0+C1");
 
-        // Prepare S0+S1+S2 response (1 + 1536 + 1536 bytes)
+        // Prepare S0+S1+S2 response
         let mut response = Vec::with_capacity(3073);
-
-        // S0 - Version
         response.push(RTMP_VERSION);
 
         // S1 - Timestamp + Zero + Random
@@ -138,46 +315,72 @@ impl RtmpConnection {
             .unwrap()
             .as_secs() as u32;
         response.extend_from_slice(&time.to_be_bytes());
-        response.extend_from_slice(&[0u8; 4]); // zeros
+        response.extend_from_slice(&[0u8; 4]);
 
-        // Generate random bytes for S1
+        // Random bytes for S1
         let random_bytes: Vec<u8> = (0..1528).map(|_| rand::random::<u8>()).collect();
         response.extend_from_slice(&random_bytes);
 
         // S2 - Echo client's C1
         response.extend_from_slice(&c0c1[1..1537]);
 
-        // Send S0+S1+S2
         self.socket.write_all(&response).await?;
         tracing::debug!("Sent S0+S1+S2");
 
-        // Read C2
         let mut c2 = [0u8; 1536];
         self.socket.read_exact(&mut c2).await?;
         tracing::debug!("Received C2");
-
         tracing::info!("Handshake completed successfully");
+
         Ok(())
     }
 
     async fn read_chunk(&mut self) -> Result<Option<RtmpChunk>, RtmpError> {
         if self.buffer.len() < 1 {
-            tracing::debug!("Reading more data into buffer");
-            let bytes_read = self.socket.read_buf(&mut self.buffer).await?;
-            if bytes_read == 0 {
-                tracing::debug!("Connection closed by peer");
-                return Ok(None);
+            let read_future = self.socket.read_buf(&mut self.buffer);
+            match tokio::time::timeout(Duration::from_secs(5), read_future).await {
+                Ok(Ok(0)) => {
+                    tracing::debug!("Connection closed by peer");
+                    return Ok(None);
+                }
+                Ok(Ok(n)) => {
+                    tracing::debug!("Read {} bytes into buffer", n);
+                    if n > 0 {
+                        // Add hexdump of received data
+                        tracing::debug!("Raw bytes received: {:02X?}", &self.buffer[..n]);
+                    }
+                }
+                Ok(Err(e)) => return Err(RtmpError::Io(e)),
+                Err(_) => return Err(RtmpError::Timeout("Read timeout".into())),
             }
-            tracing::debug!("Read {} bytes into buffer", bytes_read);
         }
 
-        tracing::debug!("Current buffer content: {:02X?}", self.buffer);
-
         let first_byte = self.buffer[0];
-        let chunk_type = first_byte >> 6;
-        let chunk_stream_id = (first_byte & 0x3F) as u32;
+        let fmt = first_byte >> 6;
+        let csid = first_byte & 0x3F;
 
-        let header_size = match chunk_type {
+        let (mut pos, chunk_stream_id) = match csid {
+            0 => {
+                if self.buffer.len() < 2 {
+                    return Ok(None);
+                }
+                (2, self.buffer[1] as u32 + 64)
+            }
+            1 => {
+                if self.buffer.len() < 3 {
+                    return Ok(None);
+                }
+                (
+                    3,
+                    (self.buffer[2] as u32) * 256 + (self.buffer[1] as u32) + 64,
+                )
+            }
+            _ => (1, csid as u32),
+        };
+
+        let previous_chunk = self.chunk_states.get(&chunk_stream_id).cloned();
+
+        let header_size = match fmt {
             0 => 11,
             1 => 7,
             2 => 3,
@@ -185,7 +388,7 @@ impl RtmpConnection {
             _ => return Err(RtmpError::Protocol("Invalid chunk type".into())),
         };
 
-        if self.buffer.len() < header_size + 1 {
+        if self.buffer.len() < pos + header_size {
             return Ok(None);
         }
 
@@ -194,10 +397,7 @@ impl RtmpConnection {
         let mut message_type_id = 0u8;
         let mut message_stream_id = 0u32;
 
-        let previous_state = self.chunk_states.get(&chunk_stream_id).cloned();
-        let mut pos = 1;
-
-        match chunk_type {
+        match fmt {
             0 => {
                 timestamp = u32::from_be_bytes([
                     0,
@@ -227,6 +427,10 @@ impl RtmpConnection {
                 pos += 4;
             }
             1 => {
+                if let Some(prev) = &previous_chunk {
+                    message_stream_id = prev.message_stream_id;
+                }
+
                 timestamp = u32::from_be_bytes([
                     0,
                     self.buffer[pos],
@@ -245,12 +449,14 @@ impl RtmpConnection {
 
                 message_type_id = self.buffer[pos];
                 pos += 1;
-
-                if let Some(state) = &previous_state {
-                    message_stream_id = state.message_stream_id;
-                }
             }
             2 => {
+                if let Some(prev) = &previous_chunk {
+                    message_length = prev.message_length;
+                    message_type_id = prev.message_type_id;
+                    message_stream_id = prev.message_stream_id;
+                }
+
                 timestamp = u32::from_be_bytes([
                     0,
                     self.buffer[pos],
@@ -258,391 +464,462 @@ impl RtmpConnection {
                     self.buffer[pos + 2],
                 ]);
                 pos += 3;
-
-                if let Some(state) = &previous_state {
-                    message_length = state.message_length;
-                    message_type_id = state.message_type_id;
-                    message_stream_id = state.message_stream_id;
-                }
             }
             3 => {
-                if let Some(state) = &previous_state {
-                    timestamp = state.timestamp;
-                    message_length = state.message_length;
-                    message_type_id = state.message_type_id;
-                    message_stream_id = state.message_stream_id;
+                if let Some(prev) = &previous_chunk {
+                    timestamp = prev.timestamp;
+                    message_length = prev.message_length;
+                    message_type_id = prev.message_type_id;
+                    message_stream_id = prev.message_stream_id;
                 } else {
                     return Err(RtmpError::Protocol(
-                        "Received type 3 chunk without previous state".into(),
+                        "Type 3 chunk without previous state".into(),
                     ));
                 }
             }
             _ => unreachable!(),
         }
 
-        // Calculate how much data we need to read
-        let mut data = Vec::new();
-        let bytes_left = if let Some(state) = previous_state {
-            state.bytes_left
-        } else {
-            message_length
-        };
+        if timestamp == 0xFFFFFF {
+            if self.buffer.len() < pos + 4 {
+                return Ok(None);
+            }
+            timestamp = u32::from_be_bytes([
+                self.buffer[pos],
+                self.buffer[pos + 1],
+                self.buffer[pos + 2],
+                self.buffer[pos + 3],
+            ]);
+            pos += 4;
+        }
 
-        let data_size = std::cmp::min(bytes_left, self.chunk_size);
-
-        if self.buffer.len() < (header_size + 1 + data_size as usize) {
+        let chunk_data_size = std::cmp::min(message_length, self.chunk_size);
+        if self.buffer.len() < pos + chunk_data_size as usize {
             return Ok(None);
         }
 
-        // Read available data
-        if data_size > 0 {
-            data.extend_from_slice(&self.buffer[pos..pos + data_size as usize]);
-        }
+        let data = self.buffer[pos..pos + chunk_data_size as usize].to_vec();
+        self.buffer.advance(pos + chunk_data_size as usize);
 
-        // Update or create chunk state
-        let new_state = ChunkStreamState {
-            timestamp,
-            message_length,
-            message_type_id,
-            message_stream_id,
-            bytes_left: bytes_left - data_size,
-            data: data.clone(),
-        };
-        self.chunk_states.insert(chunk_stream_id, new_state);
-
-        // Remove processed bytes from buffer
-        self.buffer.split_to(pos + data_size as usize);
-
-        tracing::debug!(
-            "Read chunk - type: {}, stream_id: {}, msg_type: {}, data size: {}",
-            chunk_type,
-            chunk_stream_id,
-            message_type_id,
-            data.len()
-        );
-
-        Ok(Some(RtmpChunk {
-            chunk_type,
+        let chunk = RtmpChunk {
+            chunk_type: fmt,
             chunk_stream_id,
             timestamp,
             message_length,
             message_type_id,
             message_stream_id,
             data,
-        }))
+        };
+
+        let state = ChunkStreamState {
+            timestamp: chunk.timestamp,
+            message_length: chunk.message_length,
+            message_type_id: chunk.message_type_id,
+            message_stream_id: chunk.message_stream_id,
+            bytes_left: chunk.message_length - chunk.data.len() as u32,
+            data: chunk.data.clone(),
+        };
+        self.chunk_states.insert(chunk_stream_id, state);
+
+        Ok(Some(chunk))
     }
+
     async fn process_chunk(&mut self, chunk: RtmpChunk) -> Result<(), RtmpError> {
         tracing::debug!(
-            "Processing chunk - type: {}, stream_id: {}, msg_type: 0x{:02X}, msg_len: {}, timestamp: {}, data: {:02X?}",
+            "Processing chunk - type: {}, stream_id: {}, msg_type: 0x{:02X}, msg_len: {}, timestamp: {}",
             chunk.chunk_type,
             chunk.chunk_stream_id,
             chunk.message_type_id,
             chunk.message_length,
-            chunk.timestamp,
-            chunk.data
+            chunk.timestamp
         );
 
         match chunk.message_type_id {
             RTMP_MSG_SET_CHUNK_SIZE => {
-                tracing::debug!("Handling SET_CHUNK_SIZE");
-                self.handle_set_chunk_size(&chunk).await?
+                if chunk.data.len() < 4 {
+                    return Err(RtmpError::Protocol("Invalid set chunk size message".into()));
+                }
+                let new_chunk_size = u32::from_be_bytes([
+                    chunk.data[0],
+                    chunk.data[1],
+                    chunk.data[2],
+                    chunk.data[3],
+                ]);
+                if new_chunk_size > MAX_CHUNK_SIZE {
+                    return Err(RtmpError::InvalidChunkSize(new_chunk_size));
+                }
+                tracing::debug!("Setting chunk size to: {}", new_chunk_size);
+                self.chunk_size = new_chunk_size;
             }
-            RTMP_MSG_ACK => {
-                tracing::debug!("Handling ACK");
-                self.handle_acknowledgement(&chunk).await?
-            }
-            RTMP_MSG_USER_CONTROL => {
-                tracing::debug!("Handling USER_CONTROL");
-                self.handle_user_control(&chunk).await?
-            }
+
             RTMP_MSG_WINDOW_ACK_SIZE => {
-                tracing::debug!("Handling WINDOW_ACK_SIZE");
-                self.handle_window_acknowledgement_size(&chunk).await?
+                if chunk.data.len() < 4 {
+                    return Err(RtmpError::Protocol(
+                        "Invalid window ack size message".into(),
+                    ));
+                }
+                let window_size = u32::from_be_bytes([
+                    chunk.data[0],
+                    chunk.data[1],
+                    chunk.data[2],
+                    chunk.data[3],
+                ]);
+                tracing::debug!("Window acknowledgement size set to: {}", window_size);
+
+                // Send back window ack size
+                let response = window_size.to_be_bytes().to_vec();
+                let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_WINDOW_ACK_SIZE, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&response).await?;
             }
-            RTMP_MSG_SET_PEER_BANDWIDTH => {
-                tracing::debug!("Handling SET_PEER_BANDWIDTH");
-                self.handle_set_peer_bandwidth(&chunk).await?
+
+            RTMP_MSG_USER_CONTROL => {
+                if chunk.data.len() < 2 {
+                    return Err(RtmpError::Protocol("Invalid user control message".into()));
+                }
+                let event_type = u16::from_be_bytes([chunk.data[0], chunk.data[1]]);
+                match event_type {
+                    USER_CONTROL_PING_REQUEST => {
+                        // Send ping response
+                        let mut response = vec![
+                            0x00,
+                            USER_CONTROL_PING_RESPONSE as u8, // Event type
+                        ];
+                        response.extend_from_slice(&chunk.data[2..]); // Echo timestamp
+                        let header = create_rtmp_header(
+                            0,
+                            2,
+                            0,
+                            response.len() as u32,
+                            RTMP_MSG_USER_CONTROL,
+                            0,
+                        );
+                        self.socket.write_all(&header).await?;
+                        self.socket.write_all(&response).await?;
+                    }
+                    _ => {
+                        tracing::debug!("Unhandled user control message: {}", event_type);
+                    }
+                }
             }
+
+            RTMP_MSG_AMF0_CMD | RTMP_MSG_AMF3_CMD => {
+                self.handle_amf_command(&chunk).await?;
+            }
+
             RTMP_MSG_AUDIO => {
-                tracing::debug!("Handling AUDIO");
-                self.handle_audio(&chunk).await?
+                tracing::debug!("Received audio data: {} bytes", chunk.data.len());
+                self.broadcast_tx.send(chunk.data).ok();
             }
+
             RTMP_MSG_VIDEO => {
-                tracing::debug!("Handling VIDEO");
-                self.handle_video(&chunk).await?
+                tracing::debug!("Received video data: {} bytes", chunk.data.len());
+                self.broadcast_tx.send(chunk.data).ok();
             }
-            0x14 | 0x11 | 0x61 => {
-                tracing::debug!("Handling AMF command");
-                self.handle_amf_command(&chunk).await?
-            }
-            0x12 | 0x0F => {
-                tracing::debug!("Handling AMF data");
-                self.handle_amf_data(&chunk).await?
-            }
+
             _ => {
+                tracing::debug!("Unhandled message type: 0x{:02X}", chunk.message_type_id);
+            }
+        }
+        Ok(())
+    }
+    fn parse_connect_params(&self, data: &[u8]) -> Option<HashMap<String, String>> {
+        let mut params = HashMap::new();
+        let mut pos = 3 + u16::from_be_bytes([data[1], data[2]]) as usize;
+
+        // Skip transaction ID (number marker + 8 bytes)
+        if data.len() < pos + 9 {
+            return None;
+        }
+        pos += 9;
+
+        // Must have object marker
+        if data.len() <= pos || data[pos] != 0x03 {
+            return None;
+        }
+        pos += 1;
+
+        // Add better error handling and logging here
+        while pos + 2 < data.len() {
+            if data[pos] == 0x00 && data[pos + 1] == 0x00 && data[pos + 2] == 0x09 {
+                break;
+            }
+
+            // Get property name length with bounds checking
+            if pos + 2 > data.len() {
                 tracing::warn!(
-                    "Unknown message type: 0x{:02X} (chunk type: {}), data: {:02X?}",
-                    chunk.message_type_id,
-                    chunk.chunk_type,
-                    chunk.data
+                    "Malformed connect parameters: insufficient data for property name length"
                 );
+                break;
             }
-        }
-        Ok(())
-    }
 
-    async fn handle_set_chunk_size(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        if chunk.data.len() < 4 {
-            return Err(RtmpError::Protocol("Invalid set chunk size message".into()));
-        }
+            let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
 
-        let new_chunk_size =
-            u32::from_be_bytes([chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3]]);
+            if pos + name_len > data.len() {
+                tracing::warn!("Malformed connect parameters: insufficient data for property name");
+                break;
+            }
 
-        if new_chunk_size > MAX_CHUNK_SIZE {
-            return Err(RtmpError::InvalidChunkSize(new_chunk_size));
-        }
-
-        tracing::debug!("Setting chunk size to: {}", new_chunk_size);
-        self.chunk_size = new_chunk_size;
-        Ok(())
-    }
-
-    async fn handle_user_control(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        if chunk.data.len() < 2 {
-            return Err(RtmpError::Protocol("Invalid user control message".into()));
-        }
-
-        let event_type = u16::from_be_bytes([chunk.data[0], chunk.data[1]]);
-        tracing::debug!("Received user control message, event type: {}", event_type);
-
-        match event_type {
-            0 => {
-                // Stream Begin
-                if chunk.data.len() < 6 {
-                    return Err(RtmpError::Protocol("Invalid stream begin message".into()));
+            // Get property name
+            let prop_name = match std::str::from_utf8(&data[pos..pos + name_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    tracing::warn!("Invalid UTF-8 in property name");
+                    break;
                 }
-                let stream_id = u32::from_be_bytes([
-                    chunk.data[2],
-                    chunk.data[3],
-                    chunk.data[4],
-                    chunk.data[5],
-                ]);
-                tracing::debug!("Stream begin: {}", stream_id);
+            };
+            pos += name_len;
+
+            // Add debugging for property parsing
+            tracing::debug!("Parsing property: {}", prop_name);
+
+            if pos >= data.len() {
+                break;
             }
-            1 => {
-                // Stream EOF
-                tracing::debug!("Stream EOF");
-            }
-            2 => {
-                // Stream Dry
-                tracing::debug!("Stream Dry");
-            }
-            4 => {
-                // Stream Is Recorded
-                tracing::debug!("Stream Is Recorded");
-            }
-            6 => {
-                // Client Buffer Time
-                if chunk.data.len() < 10 {
-                    return Err(RtmpError::Protocol("Invalid buffer time message".into()));
+
+            let value = match data[pos] {
+                0x02 => {
+                    // String
+                    pos += 1;
+                    if pos + 2 > data.len() {
+                        break;
+                    }
+                    let str_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + str_len > data.len() {
+                        break;
+                    }
+                    let value = std::str::from_utf8(&data[pos..pos + str_len])
+                        .ok()?
+                        .to_string();
+                    pos += str_len;
+                    value
                 }
-                let stream_id = u32::from_be_bytes([
-                    chunk.data[2],
-                    chunk.data[3],
-                    chunk.data[4],
-                    chunk.data[5],
-                ]);
-                let buffer_time = u32::from_be_bytes([
-                    chunk.data[6],
-                    chunk.data[7],
-                    chunk.data[8],
-                    chunk.data[9],
-                ]);
-                tracing::debug!(
-                    "Client buffer time: {}ms for stream {}",
-                    buffer_time,
-                    stream_id
-                );
-            }
-            _ => {
-                tracing::warn!("Unknown user control message event type: {}", event_type);
-            }
-        }
-        Ok(())
-    }
+                0x00 => {
+                    // Number
+                    pos += 1;
+                    if pos + 8 > data.len() {
+                        break;
+                    }
+                    let value = format!(
+                        "{}",
+                        f64::from_be_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                            data[pos + 4],
+                            data[pos + 5],
+                            data[pos + 6],
+                            data[pos + 7]
+                        ])
+                    );
+                    pos += 8;
+                    value
+                }
+                marker => {
+                    tracing::warn!("Unknown property value marker: 0x{:02X}", marker);
+                    break;
+                }
+            };
 
-    async fn handle_acknowledgement(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        if chunk.data.len() < 4 {
-            return Err(RtmpError::Protocol(
-                "Invalid acknowledgement message".into(),
-            ));
-        }
-
-        let sequence_number =
-            u32::from_be_bytes([chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3]]);
-
-        tracing::debug!(
-            "Received acknowledgement: sequence number {}",
-            sequence_number
-        );
-
-        // Send back an acknowledgement
-        let mut response = Vec::new();
-        response.extend_from_slice(&sequence_number.to_be_bytes());
-
-        let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_ACK, 0);
-
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&response).await?;
-
-        Ok(())
-    }
-
-    async fn handle_window_acknowledgement_size(
-        &mut self,
-        chunk: &RtmpChunk,
-    ) -> Result<(), RtmpError> {
-        if chunk.data.len() < 4 {
-            return Err(RtmpError::Protocol(
-                "Invalid window ack size message".into(),
-            ));
+            tracing::debug!("Property value: {}", value);
+            params.insert(prop_name, value);
         }
 
-        let window_size =
-            u32::from_be_bytes([chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3]]);
-
-        tracing::debug!("Window acknowledgement size set to: {}", window_size);
-
-        // Send back our window size
-        let mut response = Vec::new();
-        response.extend_from_slice(&window_size.to_be_bytes());
-
-        let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_WINDOW_ACK_SIZE, 0);
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&response).await?;
-
-        Ok(())
-    }
-
-    async fn handle_set_peer_bandwidth(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        if chunk.data.len() < 5 {
-            return Err(RtmpError::Protocol("Invalid peer bandwidth message".into()));
-        }
-
-        let window_size =
-            u32::from_be_bytes([chunk.data[0], chunk.data[1], chunk.data[2], chunk.data[3]]);
-        let limit_type = chunk.data[4];
-
-        tracing::debug!(
-            "Peer bandwidth set to: {} (limit type: {})",
-            window_size,
-            limit_type
-        );
-
-        // Send acknowledgement
-        let mut response = Vec::new();
-        response.extend_from_slice(&window_size.to_be_bytes());
-        response.push(limit_type);
-
-        let header = create_rtmp_header(0, 2, 0, 5, RTMP_MSG_SET_PEER_BANDWIDTH, 0);
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&response).await?;
-
-        Ok(())
-    }
-
-    async fn handle_audio(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        // Forward audio data to all subscribers
-        self.broadcast_tx.send(chunk.data.clone()).ok();
-
-        tracing::debug!(
-            "Received audio packet - size: {} bytes, timestamp: {}",
-            chunk.data.len(),
-            chunk.timestamp
-        );
-        Ok(())
-    }
-
-    async fn handle_video(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        // Forward video data to all subscribers
-        self.broadcast_tx.send(chunk.data.clone()).ok();
-
-        tracing::debug!(
-            "Received video packet - size: {} bytes, timestamp: {}",
-            chunk.data.len(),
-            chunk.timestamp
-        );
-        Ok(())
-    }
-
-    async fn handle_amf_data(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        if chunk.data.is_empty() {
-            return Ok(());
-        }
-
-        tracing::debug!("Received AMF data - length: {}", chunk.data.len());
-        // For now, just log AMF data
-        tracing::debug!("AMF data: {:?}", chunk.data);
-        Ok(())
+        Some(params)
     }
 
     async fn handle_amf_command(&mut self, chunk: &RtmpChunk) -> Result<(), RtmpError> {
-        tracing::debug!("Received AMF command - data length: {}", chunk.data.len());
-        if chunk.data.is_empty() {
-            return Ok(());
+        let data = if chunk.message_type_id == RTMP_MSG_AMF3_CMD {
+            &chunk.data[1..]
+        } else {
+            &chunk.data[..]
+        };
+
+        if data.len() < 3 {
+            return Err(RtmpError::Protocol("Invalid AMF command message".into()));
         }
 
-        // Log raw data for debugging
-        tracing::debug!("AMF command raw data: {:02X?}", chunk.data);
+        let command_name_length = u16::from_be_bytes([data[1], data[2]]) as usize;
+        if data.len() < 3 + command_name_length {
+            return Err(RtmpError::Protocol("Invalid AMF command length".into()));
+        }
 
-        // Send connect response
-        let response = vec![
-            0x02, // String marker
-            0x00, 0x07, // String length (7)
-            b'_', b'r', b'e', b's', b'u', b'l', b't', // "_result"
-            0x00, // Number marker
-            0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (1.0)
-            0x03, // Object marker
-            0x00, 0x05, // Property name length (5)
-            b'f', b'm', b's', b'V', b'r', // "fmsVr"
-            0x02, // String marker
-            0x00, 0x0D, // String length (13)
-            b'F', b'M', b'S', b'/', b'3', b',', b'0', b',', b'0', b',', b'0', b'0',
-            b'0', // "FMS/3,0,0,000"
-            0x00, 0x00, 0x09, // Object end marker
-            0x03, // Object marker
-            0x00, 0x0C, // Property name length (12)
-            b'c', b'a', b'p', b'a', b'b', b'i', b'l', b'i', b't', b'i', b'e',
-            b's', // "capabilities"
-            0x00, // Number marker
-            0x40, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Number value (31.0)
-            0x00, 0x00, 0x09, // Object end marker
-        ];
+        let command_name = String::from_utf8_lossy(&data[3..3 + command_name_length]);
+        tracing::debug!("Processing AMF command: {}", command_name);
 
-        let header = create_rtmp_header(0, 3, 0, response.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+        match command_name.as_ref() {
+            "connect" => {
+                tracing::debug!("Connect command data: {:02X?}", data);
+                if let Some(params) = self.parse_connect_params(data) {
+                    tracing::debug!("Connect parameters: {:?}", params);
+                    self.state.app_name = params.get("app").cloned();
+                    tracing::debug!("Using app name: {:?}", self.state.app_name);
+                }
 
-        tracing::debug!("Sending AMF response");
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&response).await?;
+                self.state.is_connected = true;
+                // Parse app name from connect command
+                if let Some(app_name) = self.parse_app_name_from_connect(data) {
+                    self.state.app_name = Some(app_name);
+                    tracing::debug!(
+                        "Connected to application: {}",
+                        self.state.app_name.as_ref().unwrap()
+                    );
+                }
 
-        // Set initial window acknowledgement size
-        let window_ack = vec![0x00, 0x26, 0x25, 0xA0]; // 2500000 bytes
-        let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_WINDOW_ACK_SIZE, 0);
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&window_ack).await?;
+                self.state.is_connected = true;
 
-        // Set peer bandwidth
-        let peer_bandwidth = vec![0x00, 0x26, 0x25, 0xA0, 0x02]; // 2500000 bytes, dynamic
-        let header = create_rtmp_header(0, 2, 0, 5, RTMP_MSG_SET_PEER_BANDWIDTH, 0);
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&peer_bandwidth).await?;
+                // Send Window Acknowledgement Size
+                let window_ack = 2500000u32.to_be_bytes().to_vec();
+                let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_WINDOW_ACK_SIZE, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&window_ack).await?;
 
-        // Set chunk size
-        let chunk_size = vec![0x00, 0x00, 0x10, 0x00]; // 4096 bytes
-        let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_SET_CHUNK_SIZE, 0);
-        self.socket.write_all(&header).await?;
-        self.socket.write_all(&chunk_size).await?;
+                // Set Peer Bandwidth
+                let mut peer_bandwidth = 2500000u32.to_be_bytes().to_vec();
+                peer_bandwidth.push(2); // Dynamic type
+                let header = create_rtmp_header(0, 2, 0, 5, RTMP_MSG_SET_PEER_BANDWIDTH, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&peer_bandwidth).await?;
+
+                // Set Chunk Size
+                let chunk_size = 4096u32.to_be_bytes().to_vec();
+                let header = create_rtmp_header(0, 2, 0, 4, RTMP_MSG_SET_CHUNK_SIZE, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&chunk_size).await?;
+
+                // Send connect result
+                let result = create_amf0_connect_response();
+                let header = create_rtmp_header(0, 3, 0, result.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&result).await?;
+
+                // Send onBWDone
+                let bw_done = create_amf0_on_bw_done();
+                let header =
+                    create_rtmp_header(0, 3, 0, bw_done.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&bw_done).await?;
+
+                tracing::debug!("Connect sequence completed");
+            }
+            "_checkbw" => {
+                tracing::debug!("Handling _checkbw command with data: {:02X?}", data);
+                let response = create_amf0_checkbw_response();
+                let header =
+                    create_rtmp_header(0, 3, 0, response.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&response).await?;
+
+                // Send checkbw begin notification
+                let begin_notif = vec![
+                    0x00, 0x00, // Event type (stream begin)
+                    0x00, 0x00, 0x00, 0x00, // Stream ID
+                ];
+                let header = create_rtmp_header(0, 2, 0, 6, RTMP_MSG_USER_CONTROL, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&begin_notif).await?;
+
+                tracing::debug!("Sent _checkbw response and notifications");
+            }
+
+            "createStream" => {
+                self.state.stream_id += 1;
+                let response = create_amf0_create_stream_response(self.state.stream_id);
+                let header =
+                    create_rtmp_header(0, 3, 0, response.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&response).await?;
+
+                // Send Stream Begin event
+                let mut stream_begin = vec![
+                    0x00,
+                    USER_CONTROL_STREAM_BEGIN as u8, // Event type
+                ];
+                stream_begin.extend_from_slice(&self.state.stream_id.to_be_bytes());
+                let header = create_rtmp_header(0, 2, 0, 6, RTMP_MSG_USER_CONTROL, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&stream_begin).await?;
+
+                tracing::debug!("Created stream with ID: {}", self.state.stream_id);
+            }
+
+            "publish" => {
+                tracing::debug!("Handling publish command with data: {:02X?}", data);
+
+                // If we haven't got a stream key yet, try to get it from publish command
+                if self.state.stream_key.is_none() {
+                    if let Some(stream_name) = self.parse_stream_name(data) {
+                        tracing::debug!("Publishing to stream: {}", stream_name);
+                        self.state.stream_key = Some(stream_name);
+                    }
+                }
+
+                // Send publish success response
+                let response = vec![
+                    0x02, // String marker
+                    0x00, 0x08, // String length (8)
+                    b'o', b'n', b'S', b't', b'a', b't', b'u', b's', 0x00, // Number marker
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (0)
+                    0x05, // NULL marker
+                    0x03, // Object marker
+                    0x00, 0x04, // Property name length (4)
+                    b'c', b'o', b'd', b'e', 0x02, // String marker
+                    0x00, 0x17, // String length (23)
+                    b'N', b'e', b't', b'S', b't', b'r', b'e', b'a', b'm', b'.', b'P', b'u', b'b',
+                    b'l', b'i', b's', b'h', b'.', b'S', b't', b'a', b'r', b't', 0x00,
+                    0x07, // Property name length (7)
+                    b's', b'u', b'c', b'c', b'e', b's', b's', 0x00, 0x00,
+                    0x09, // Object end marker
+                ];
+
+                let header =
+                    create_rtmp_header(0, 3, 0, response.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&response).await?;
+
+                // Send User Control Message - Stream Begin
+                let mut stream_begin = vec![0x00, USER_CONTROL_STREAM_BEGIN as u8];
+                stream_begin.extend_from_slice(&self.state.stream_id.to_be_bytes());
+                let header = create_rtmp_header(0, 2, 0, 6, RTMP_MSG_USER_CONTROL, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&stream_begin).await?;
+
+                tracing::debug!("Publish setup completed");
+            }
+
+            "releaseStream" => {
+                tracing::debug!("Handling releaseStream command with data: {:02X?}", data);
+                if let Some(stream_name) = self.parse_stream_name(data) {
+                    tracing::debug!("Release stream name: {}", stream_name);
+                    self.state.stream_key = Some(stream_name);
+                }
+
+                let response = create_amf0_release_stream_response();
+                let header =
+                    create_rtmp_header(0, 3, 0, response.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&response).await?;
+
+                tracing::debug!("Sent releaseStream response");
+            }
+
+            "FCPublish" => {
+                tracing::debug!("Handling FCPublish command");
+                let response = create_amf0_fcpublish_response();
+                let header =
+                    create_rtmp_header(0, 3, 0, response.len() as u32, RTMP_MSG_AMF0_CMD, 0);
+                self.socket.write_all(&header).await?;
+                self.socket.write_all(&response).await?;
+            }
+
+            // Catch-all pattern for unhandled commands
+            cmd => {
+                tracing::debug!("Unhandled command: {}", cmd);
+            }
+        }
 
         Ok(())
     }
@@ -657,8 +934,6 @@ fn create_rtmp_header(
     message_stream_id: u32,
 ) -> Vec<u8> {
     let mut header = Vec::new();
-
-    // Format and chunk stream ID
     header.push((chunk_type << 6) | (chunk_stream_id & 0x3F));
 
     match chunk_type {
@@ -667,7 +942,7 @@ fn create_rtmp_header(
             header.extend_from_slice(&timestamp.to_be_bytes()[1..]);
             // Message length (3 bytes)
             header.extend_from_slice(&message_length.to_be_bytes()[1..]);
-            // Message type ID
+            // Message type ID (1 byte)
             header.push(message_type_id);
             // Message stream ID (4 bytes, little-endian)
             header.extend_from_slice(&message_stream_id.to_le_bytes());
@@ -677,7 +952,7 @@ fn create_rtmp_header(
             header.extend_from_slice(&timestamp.to_be_bytes()[1..]);
             // Message length (3 bytes)
             header.extend_from_slice(&message_length.to_be_bytes()[1..]);
-            // Message type ID
+            // Message type ID (1 byte)
             header.push(message_type_id);
         }
         2 => {
@@ -690,6 +965,122 @@ fn create_rtmp_header(
     header
 }
 
+fn create_amf0_release_stream_response() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x07, // String length (7)
+        b'_', b'r', b'e', b's', b'u', b'l', b't', // "_result"
+        0x00, // Number marker
+        0x40, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (3.0)
+        0x05, // NULL marker
+        0x05, // NULL marker for result
+    ]
+}
+
+fn create_amf0_result_response() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x07, // String length (7)
+        b'_', b'r', b'e', b's', b'u', b'l', b't', // "_result"
+        0x00, // Number marker
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (2.0)
+        0x05, // NULL marker
+    ]
+}
+
+fn create_amf0_fcpublish_response() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x08, // String length (8)
+        b'o', b'n', b'F', b'C', b'P', b'u', b'b', b'l', b'i', b's', b'h',
+        0x00, // Number marker
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (0.0)
+        0x05, // NULL marker
+    ]
+}
+
+fn create_amf0_connect_response() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x07, // String length (7)
+        b'_', b'r', b'e', b's', b'u', b'l', b't', // "_result"
+        0x00, // Number marker
+        0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (1.0)
+        0x03, // Object marker
+        0x00, 0x05, // Property name length (5)
+        b'l', b'e', b'v', b'e', b'l', // "level"
+        0x02, // String marker
+        0x00, 0x06, // String length (6)
+        b's', b't', b'a', b't', b'u', b's', // "status"
+        0x00, 0x04, // Property name length (4)
+        b'c', b'o', b'd', b'e', // "code"
+        0x02, // String marker
+        0x00, 0x17, // String length (23)
+        b'N', b'e', b't', b'C', b'o', b'n', b'n', b'e', b'c', b't', b'i', b'o', b'n', b'.', b'C',
+        b'o', b'n', b'n', b'e', b'c', b't', b'.', b'O', b'K', 0x00, 0x00,
+        0x09, // Object end marker
+        0x03, // Object marker (properties)
+        0x00, 0x0C, // Property name length (12)
+        b'c', b'a', b'p', b'a', b'b', b'i', b'l', b'i', b't', b'i', b'e', b's',
+        0x00, // Number marker
+        0x40, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 31.0
+        0x00, 0x00, 0x09, // Object end marker
+    ]
+}
+
+fn create_amf0_on_bw_done() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x08, // String length (8)
+        b'o', b'n', b'B', b'W', b'D', b'o', b'n', b'e', 0x00, // Number marker
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (0.0)
+        0x05, // NULL marker
+    ]
+}
+
+fn create_amf0_create_stream_response(stream_id: u32) -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x07, // String length (7)
+        b'_', b'r', b'e', b's', b'u', b'l', b't', // "_result"
+        0x00, // Number marker
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (2.0)
+        0x05, // NULL marker
+        0x00, // Number marker
+        0x3F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Stream ID (1.0)
+    ]
+}
+
+fn create_amf0_publish_response() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x08, // String length (8)
+        b'o', b'n', b'S', b't', b'a', b't', b'u', b's', 0x00, // Number marker
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (0.0)
+        0x05, // NULL marker
+        0x03, // Object marker
+        0x00, 0x06, // Property name length (6)
+        b's', b't', b'a', b't', b'u', b's', 0x02, // String marker
+        0x00, 0x07, // String length (7)
+        b's', b'u', b'c', b'c', b'e', b's', b's', 0x00, 0x00, 0x09, // Object end marker
+    ]
+}
+
+fn create_amf0_checkbw_response() -> Vec<u8> {
+    vec![
+        0x02, // String marker
+        0x00, 0x07, // String length (7)
+        b'_', b'r', b'e', b's', b'u', b'l', b't', // "_result"
+        0x00, // Number marker
+        0x3F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Transaction ID (1.0)
+        0x05, // NULL marker
+        0x02, // String marker
+        0x00, 0x0A, // String length (10)
+        b'_', b'c', b'h', b'e', b'c', b'k', b'b', b'w', b'_', b'r', // "_checkbw_r"
+    ]
+}
+
+// Main function implementation
 async fn run_rtmp_server(
     listener: TcpListener,
     streams: Arc<DashMap<u32, StreamMetadata>>,
@@ -702,19 +1093,23 @@ async fn run_rtmp_server(
             tracing::info!("New connection from {}", addr);
             let connection = RtmpConnection::new(socket, streams);
             if let Err(e) = connection.handle_connection().await {
-                tracing::error!("Connection error: {}", e);
+                tracing::error!("Connection error for {}: {}", addr, e);
             }
+            tracing::info!("Connection closed for {}", addr);
         });
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 
     let streams = Arc::new(DashMap::new());
 
-    // RTMP server setup
+    // RTMP server setup (default RTMP port is 1935)
     let rtmp_addr: SocketAddr = "127.0.0.1:1935".parse()?;
     let rtmp_listener = TcpListener::bind(rtmp_addr).await?;
     tracing::info!("RTMP server listening on {}", rtmp_addr);
@@ -722,12 +1117,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HTTP metrics server setup
     let app = Router::new()
         .route("/", get(|| async { "RTMP Server" }))
-        .route("/metrics", get(|| async { "Metrics coming soon" }));
+        .route(
+            "/metrics",
+            get(|| async {
+                let metrics = "Metrics endpoint - Coming soon\n";
+                metrics
+            }),
+        );
 
     let http_addr: SocketAddr = "127.0.0.1:3000".parse()?;
     let http_listener = TcpListener::bind(http_addr).await?;
     tracing::info!("HTTP metrics server listening on {}", http_addr);
 
+    // Run both servers concurrently
     tokio::select! {
         result = run_rtmp_server(rtmp_listener, streams.clone()) => {
             if let Err(e) = result {
