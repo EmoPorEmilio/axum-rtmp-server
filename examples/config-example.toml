@@ -1,0 +1,44 @@
+# Example configuration for axum-rtmp-server
+# Copy this to config.toml and adjust as needed
+
+[rtmp]
+# Address to listen for RTMP connections
+addr = "0.0.0.0:1935"
+
+[server]
+# Maximum concurrent connections
+max_connections = 100
+# Connection timeout in seconds (idle connection cleanup)
+timeout_seconds = 30
+
+[http]
+# Address for HTTP metrics endpoint
+addr = "0.0.0.0:3000"
+
+[auth]
+# Stream keys that are allowed to publish
+# OBS should use one of these as the stream key
+allowed_stream_keys = [
+    "my_secret_stream_key",
+    "test_key"
+]
+
+[destinations]
+# Enable/disable destinations
+# These reference entries in secrets.toml
+twitch = { enabled = true }
+youtube = { enabled = true }
+tiktok = { enabled = false }
+
+[retry]
+# Retry configuration for failed destination connections
+# Exponential backoff: delay = initial_interval * (multiplier ^ attempt)
+initial_interval_ms = 1000
+max_interval_ms = 30000
+max_attempts = 7
+multiplier = 2.0
+
+[hotreload]
+# Watch config.toml and secrets.toml for changes
+enabled = true
+check_interval_ms = 1000

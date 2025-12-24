@@ -1,0 +1,28 @@
+[rtmp]
+addr = "0.0.0.0:1935"
+
+[server]
+max_connections = 100
+timeout_seconds = 30
+
+[http]
+addr = "0.0.0.0:3000"
+
+[auth]
+allowed_stream_keys = ["obs_source_key", "test_key"]
+
+[destinations]
+# Destination names reference keys in secrets.toml
+twitch = { enabled = true }
+youtube = { enabled = true }
+tiktok = { enabled = false }
+
+[retry]
+initial_interval_ms = 1000
+max_interval_ms = 30000
+max_attempts = 7
+multiplier = 2.0
+
+[hotreload]
+enabled = true
+check_interval_ms = 1000
