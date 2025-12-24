@@ -6,6 +6,7 @@ pub mod ack;
 pub use handshake::{perform_server_handshake, perform_client_handshake};
 pub use chunk::{
     RTMP_VERSION, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, INITIAL_BUFFER_SIZE, MAX_BUFFER_SIZE,
+    MAX_PENDING_MESSAGES,
     RTMP_MSG_WINDOW_ACK_SIZE, RTMP_MSG_SET_CHUNK_SIZE, RTMP_MSG_ACK, RTMP_MSG_USER_CONTROL,
     RTMP_MSG_SET_PEER_BANDWIDTH, RTMP_MSG_AUDIO, RTMP_MSG_VIDEO,
     RTMP_MSG_AMF3_CMD, RTMP_MSG_AMF3_DATA, RTMP_MSG_AMF0_CMD,
@@ -13,7 +14,8 @@ pub use chunk::{
     USER_CONTROL_STREAM_BEGIN, USER_CONTROL_STREAM_EOF, USER_CONTROL_STREAM_DRY,
     USER_CONTROL_SET_BUFFER_LENGTH, USER_CONTROL_STREAM_IS_RECORDED,
     USER_CONTROL_PING_REQUEST, USER_CONTROL_PING_RESPONSE,
-    RtmpChunk, ChunkHeader, MessageAssembler, AssembledMessage
+    RtmpChunk, ChunkHeader, ChunkStreamState, MessageAssembler, AssembledMessage,
+    ChunkReader, ChunkWriter, create_chunk_header,
 };
 pub use message::{MessageType, UserControlEvent};
-pub use ack::{AckTracker};
+pub use ack::AckTracker;

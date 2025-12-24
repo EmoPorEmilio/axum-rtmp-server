@@ -1,0 +1,38 @@
+# Build artifacts
+target/
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Local config with secrets
+secrets.toml
+
+# Test files
+tests/
+benches/
+
+# CI/CD
+.github/
+
+# Scripts (not needed in container)
+scripts/
+
+# Docker files (avoid recursive copy)
+docker-compose*.yml
+Dockerfile*
+
+# Misc
+.env
+*.log

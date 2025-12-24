@@ -1,0 +1,29 @@
+# Docker-specific configuration for integration testing
+[rtmp]
+addr = "0.0.0.0:1935"
+
+[server]
+max_connections = 100
+timeout_seconds = 30
+
+[http]
+addr = "0.0.0.0:8080"
+
+[auth]
+# Test stream keys for integration testing
+allowed_stream_keys = ["test-stream-key", "integration-test-key"]
+
+[destinations]
+# Docker container destinations
+primary = { enabled = true }
+backup = { enabled = true }
+
+[retry]
+initial_interval_ms = 1000
+max_interval_ms = 30000
+max_attempts = 5
+multiplier = 2.0
+
+[hotreload]
+enabled = false
+check_interval_ms = 1000

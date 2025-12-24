@@ -6,7 +6,7 @@ max_connections = 100
 timeout_seconds = 30
 
 [http]
-addr = "0.0.0.0:3000"
+addr = "0.0.0.0:8080"
 
 [auth]
 allowed_stream_keys = ["obs_source_key", "test_key"]

@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # Our RTMP multi-destination server
+  rtmp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rtmp-server
+    ports:
+      - "1935:1935"     # RTMP ingress
+      - "8080:8080"     # HTTP metrics
+    volumes:
+      - ./docker/config.docker.toml:/app/config.toml:ro
+      - ./docker/secrets.docker.toml:/app/secrets.toml:ro
+    environment:
+      - RUST_LOG=info
+    depends_on:
+      - nginx-rtmp-primary
+      - nginx-rtmp-backup
+    networks:
+      - rtmp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Primary destination (simulates Twitch/YouTube)
+  nginx-rtmp-primary:
+    image: tiangolo/nginx-rtmp:latest
+    container_name: nginx-rtmp-primary
+    ports:
+      - "1936:1935"     # RTMP
+      - "8081:8080"     # HTTP/HLS
+    volumes:
+      - ./docker/nginx-rtmp.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - rtmp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Backup destination (simulates secondary platform)
+  nginx-rtmp-backup:
+    image: tiangolo/nginx-rtmp:latest
+    container_name: nginx-rtmp-backup
+    ports:
+      - "1937:1935"     # RTMP
+      - "8082:8080"     # HTTP/HLS
+    volumes:
+      - ./docker/nginx-rtmp.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - rtmp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # FFmpeg container for generating test streams
+  ffmpeg-test:
+    image: jrottenberg/ffmpeg:4.4-alpine
+    container_name: ffmpeg-test
+    profiles:
+      - test
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Wait for RTMP server to be ready
+        sleep 5
+
+        # Generate a test pattern and stream to our server
+        ffmpeg -re \
+          -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+          -f lavfi -i "sine=frequency=1000:sample_rate=44100" \
+          -c:v libx264 -preset ultrafast -tune zerolatency \
+          -c:a aac -ar 44100 -ac 2 \
+          -f flv "rtmp://rtmp-server:1935/live/test-stream-key" \
+          -t 60
+    depends_on:
+      - rtmp-server
+    networks:
+      - rtmp-network
+
+networks:
+  rtmp-network:
+    driver: bridge
